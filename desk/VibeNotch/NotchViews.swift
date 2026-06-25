@@ -15,6 +15,7 @@ struct NotchCompactDot: View {
 /// - trailing: count badge (or static green if there are sessions)
 struct NotchCompactSummary: View {
     @ObservedObject var store: SessionStore
+    @ObservedObject var agentManager: AgentSessionManager
     let position: Position
 
     enum Position { case leading, trailing }
@@ -27,12 +28,12 @@ struct NotchCompactSummary: View {
                     .fill(aggregateColor)
                     .frame(width: 6, height: 6)
             case .trailing:
-                if store.sessions.isEmpty {
+                if totalSessionCount == 0 {
                     Circle()
                         .stroke(DesignTokens.textTertiary, lineWidth: 1)
                         .frame(width: 6, height: 6)
                 } else {
-                    Text("\(store.sessions.count)")
+                    Text("\(totalSessionCount)")
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .foregroundStyle(DesignTokens.textPrimary)
                 }
@@ -41,9 +42,13 @@ struct NotchCompactSummary: View {
         .animation(DesignTokens.stateTween, value: aggregateColor)
     }
 
+    private var totalSessionCount: Int {
+        store.sessions.count + agentManager.sessions.count
+    }
+
     private var aggregateColor: Color {
-        // Priority: waiting (orange) > working (blue) > done (green) > idle (gray)
-        var hasWorking = false, hasDone = false
+        // Priority: waiting (orange) > error (red) > working (blue) > done (green) > idle (gray)
+        var hasError = false, hasWorking = false, hasDone = false
         for s in store.sessions {
             switch s.state {
             case .waiting: return DesignTokens.stateWaiting
@@ -52,6 +57,21 @@ struct NotchCompactSummary: View {
             case .idle:    break
             }
         }
+        for s in agentManager.sessions {
+            switch s.status {
+            case .needsResponse:
+                return DesignTokens.stateWaiting
+            case .error:
+                hasError = true
+            case .starting, .working:
+                hasWorking = true
+            case .done:
+                hasDone = true
+            case .idle, .waitingInput:
+                break
+            }
+        }
+        if hasError   { return Color(hex: 0xFF453A) }
         if hasWorking { return DesignTokens.stateWorking }
         if hasDone    { return DesignTokens.stateDone }
         return DesignTokens.stateIdle
@@ -142,22 +162,33 @@ struct NotchExpandedView: View {
     }
 
     /// 需要你作答的控制台(stream-json)会话:有选择题/计划确认 pending,或有待处理审批卡。
+    private func consoleNeedsAction(_ s: AgentSession) -> Bool {
+        s.pending.contains { $0.kind == .choice || $0.kind == .planConfirm }
+        || s.messages.contains { $0.kind == .permission && $0.permState == nil }
+    }
+
     private var consolePendings: [AgentSession] {
-        agentManager.sessions.filter { s in
-            s.pending.contains { $0.kind == .choice || $0.kind == .planConfirm }
-            || s.messages.contains { $0.kind == .permission && $0.permState == nil }
-        }
+        agentManager.sessions.filter(consoleNeedsAction)
+    }
+
+    private var consoleSessions: [AgentSession] {
+        agentManager.sessions.filter { !consoleNeedsAction($0) }
+    }
+
+    private var totalSessionCount: Int {
+        store.sessions.count + agentManager.sessions.count
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if store.sessions.isEmpty && consolePendings.isEmpty {
+            if totalSessionCount == 0 {
                 emptyState
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         if !consolePendings.isEmpty { consoleSection }
+                        if !consoleSessions.isEmpty { consoleSessionList }
                         if !store.sessions.isEmpty { sessionList }
                     }
                 }
@@ -186,10 +217,23 @@ struct NotchExpandedView: View {
         }
     }
 
+    private var consoleSessionList: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(consoleSessions.enumerated()), id: \.element.id) { idx, session in
+                if idx > 0 || !consolePendings.isEmpty {
+                    Divider()
+                        .background(DesignTokens.borderDivider)
+                        .padding(.leading, 22)
+                }
+                NotchConsoleSessionRow(session: session)
+            }
+        }
+    }
+
     private var sessionList: some View {
         VStack(spacing: 0) {
             ForEach(Array(store.sessions.enumerated()), id: \.element.id) { idx, entry in
-                        if idx > 0 {
+                        if idx > 0 || !consolePendings.isEmpty || !consoleSessions.isEmpty {
                             Divider()
                                 .background(DesignTokens.borderDivider)
                                 .padding(.leading, 22)
@@ -241,8 +285,8 @@ struct NotchExpandedView: View {
                 .foregroundStyle(DesignTokens.textPrimary)
                 .tracking(0.2)
             Spacer()
-            if !store.sessions.isEmpty {
-                Text("\(store.sessions.count)")
+            if totalSessionCount > 0 {
+                Text("\(totalSessionCount)")
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .foregroundStyle(DesignTokens.textTertiary)
                     .padding(.horizontal, 6)
@@ -907,6 +951,121 @@ struct NotchQuestionCard: View {
         .padding(8)
         .background(Color.orange.opacity(0.10))
         .cornerRadius(8)
+    }
+}
+
+/// 普通控制台(stream-json/app-server)会话行。没有待决项时也显示在刘海里,
+/// 否则当前项目会话只存在于 Web Console/手机,刘海展开会看起来是空的。
+struct NotchConsoleSessionRow: View {
+    let session: AgentSession
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .center, spacing: DesignTokens.spaceSM) {
+                statusDot
+                Text(primaryText)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(DesignTokens.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Text(session.agent.rawValue)
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.68))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
+                Text(elapsedText)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(DesignTokens.textTertiary)
+            }
+            if let secondary = secondaryText {
+                Text(secondary)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(DesignTokens.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.leading, DesignTokens.stateDot * 3 + DesignTokens.spaceSM)
+            }
+        }
+        .padding(.horizontal, DesignTokens.spaceSM)
+        .padding(.vertical, DesignTokens.spaceXS + 2)
+    }
+
+    private var statusDot: some View {
+        ZStack {
+            if session.status == .starting || session.status == .working {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: DesignTokens.stateDot, height: DesignTokens.stateDot)
+                    .scaleEffect(2.2)
+                    .opacity(0.18)
+            }
+            Circle()
+                .fill(statusColor)
+                .frame(width: DesignTokens.stateDot, height: DesignTokens.stateDot)
+        }
+        .frame(width: DesignTokens.stateDot * 3.0, height: DesignTokens.stateDot * 3.0)
+    }
+
+    private var statusColor: Color {
+        switch session.status {
+        case .needsResponse:
+            return DesignTokens.stateWaiting
+        case .starting, .working:
+            return DesignTokens.stateWorking
+        case .done:
+            return DesignTokens.stateDone
+        case .error:
+            return Color(hex: 0xFF453A)
+        case .idle, .waitingInput:
+            return DesignTokens.stateIdle
+        }
+    }
+
+    private var primaryText: String {
+        if let firstUser = session.messages.first(where: { $0.role == "user" && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            return flatten(firstUser.text)
+        }
+        if !session.title.isEmpty { return session.title }
+        return session.agent == .codex ? "Codex 会话" : "Claude 会话"
+    }
+
+    private var secondaryText: String? {
+        let status = statusText
+        guard let last = session.messages.reversed().first(where: { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return status
+        }
+        let msg = flatten(last.text)
+        if msg == primaryText { return status }
+        return "\(status) · \(msg)"
+    }
+
+    private var statusText: String {
+        switch session.status {
+        case .starting:     return "启动中"
+        case .idle:         return "空闲"
+        case .working:      return "思考中"
+        case .waitingInput: return "等待输入"
+        case .needsResponse:return "需要处理"
+        case .done:         return "已结束"
+        case .error:        return "出错"
+        }
+    }
+
+    private var elapsedText: String {
+        let secs = max(0, Int(Date().timeIntervalSince(session.startedAt)))
+        if secs < 60 { return "\(secs)s" }
+        if secs < 3600 { return "\(secs / 60)m" }
+        return "\(secs / 3600)h"
+    }
+
+    private func flatten(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: { $0.isNewline || $0 == "\t" })
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 }
 

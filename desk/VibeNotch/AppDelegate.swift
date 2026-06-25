@@ -754,8 +754,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 )
             },
-            compactLeading: { NotchCompactSummary(store: store, position: .leading) },
-            compactTrailing: { NotchCompactSummary(store: store, position: .trailing) }
+            compactLeading: { NotchCompactSummary(store: store, agentManager: agentManager, position: .leading) },
+            compactTrailing: { NotchCompactSummary(store: store, agentManager: agentManager, position: .trailing) }
         )
         notch = n
 
